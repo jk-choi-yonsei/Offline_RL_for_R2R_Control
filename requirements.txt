@@ -1,0 +1,19 @@
+# Offline RL for R2R Control
+# Core
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Offline RL
+d3rlpy>=2.0.0
+
+# Visualization & Experiment Tracking
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.15.0
+tensorboard>=2.14.0
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
