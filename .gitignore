@@ -5,3 +5,9 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .omc/
+
+# Datasets
+# CMP1 (PHM 2016) is mirrored under good-faith reproducibility (see Dataset/CMP1/LICENSE.txt)
+!Dataset/CMP1/
+# CMP2 is industrial NDA — never commit raw or processed data
+Dataset/CMP2/

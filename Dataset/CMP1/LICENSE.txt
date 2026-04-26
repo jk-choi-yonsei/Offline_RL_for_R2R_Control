@@ -1,0 +1,38 @@
+PHM 2016 Data Challenge — CMP Dataset (Mirror)
+===============================================
+
+Original source
+---------------
+PHM Society, "PHM 2016 Data Challenge — CMP Dataset," 2016.
+Original distribution page (challenge description and historical download links):
+  https://phmsociety.org/conference/annual-conference-of-the-phm-society/annual-conference-of-the-prognostics-and-health-management-society-2016/phm-data-challenge-4/
+
+Copyright
+---------
+© PHM Society, 2016. All rights to the original dataset are retained by
+PHM Society and the original dataset providers.
+
+Redistribution rationale
+------------------------
+This redistribution is provided in good faith to enable academic
+reproducibility, given that the original distribution channel is no longer
+functional. PHM Society retains all original rights to the dataset. This
+mirror will be removed promptly upon request from PHM Society or any party
+with authoritative copyright interest.
+
+Takedown contact
+----------------
+For takedown requests or any copyright concern, contact:
+  jkchoi0415@gmail.com
+
+Citation
+--------
+When using this dataset, please cite:
+
+@misc{phm2016,
+  author       = {{PHM Society}},
+  title        = {{PHM} 2016 Data Challenge---{CMP} Dataset},
+  year         = {2016},
+  howpublished = {\url{https://phmsociety.org/conference/annual-conference-of-the-phm-society/annual-conference-of-the-prognostics-and-health-management-society-2016/phm-data-challenge-4/}},
+  note         = {Reproducibility mirror: \url{https://github.com/jk-choi-yonsei/Offline_RL_for_R2R_Control}}
+}
