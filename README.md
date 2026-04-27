@@ -8,6 +8,8 @@ SARC comprises:
 1. **Drift Encoder** — a bottleneck MLP pre-trained via auxiliary RR-prediction to distill wear telemetry into a 2-D context vector
 2. **Drift-conditioned CQL policy** — maps (state, context) to zone-pressure recipes using Conservative Q-Learning
 
+[![DOI](https://zenodo.org/badge/doi/10.5281/zenodo.19803295.svg)](https://doi.org/10.5281/zenodo.19803295)
+
 ---
 
 ## Repository Structure
