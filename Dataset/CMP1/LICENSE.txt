@@ -34,5 +34,5 @@ When using this dataset, please cite:
   title        = {{PHM} 2016 Data Challenge---{CMP} Dataset},
   year         = {2016},
   howpublished = {\url{https://phmsociety.org/conference/annual-conference-of-the-phm-society/annual-conference-of-the-prognostics-and-health-management-society-2016/phm-data-challenge-4/}},
-  note         = {Reproducibility mirror: \url{https://github.com/jk-choi-yonsei/Offline_RL_for_R2R_Control}}
+  note         = {Reproducibility mirror: \url{https://doi.org/10.5281/zenodo.19803295}}
 }
