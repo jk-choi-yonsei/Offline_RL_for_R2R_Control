@@ -1,14 +1,16 @@
 """
 CMP2 SARC Training + Evaluation Pipeline.
 
-End-to-end: preprocess -> encoder pretrain -> CQL training -> Neural WM evaluation.
+End-to-end: preprocess → encoder pretrain → CQL training → Neural WM evaluation.
+Follows the same pattern as train_sarc_sim.py / train_sarc_cmp1.py:
   - Val MAE best checkpoint selection
   - Neural World Model (5-ensemble) for dynamics rollout
-  - Full baseline comparison (D-EWMA, Kalman, BC)
+Trains and sanity-evaluates the learned policies (SARC / SARC-no-drift / BC).
+Baseline comparison (standard/age D-EWMA, Kalman) uses precomputed grids in results/e6_grid_*.json (see scripts/sweep_gamma.py).
 
 Usage:
   python src/rl/train_sarc.py                        # default ctx=2
-  python src/rl/train_sarc.py --context-dim 4        # context dim sensitivity
+  python src/rl/train_sarc.py --context-dim 4        # Appendix B sensitivity
   python src/rl/train_sarc.py --skip-train            # eval only (existing ckpt)
 
 Paper final CMP2: cql_alpha=1.0, bc_weight=0.5, context_dim=2,
@@ -27,20 +29,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from src.data.config import RESULTS_DIR, CHECKPOINT_DIR
-try:
-    from src.data.preprocess_cmp2 import preprocess_cmp2
-except ImportError:
-    def preprocess_cmp2(*args, **kwargs):
-        raise RuntimeError(
-            "CMP2 dataset is private (industrial fab data) and not included "
-            "in this submission package. To reproduce CMP2 results, use the "
-            "pre-trained checkpoints with --skip-train and the provided result JSONs."
-        )
+from src.data.preprocess_cmp2 import preprocess_cmp2
 from src.data.mdp_dataset import split_data
 from src.rl.sarc_agent import SARCAgent
 from src.rl.bc_agent import BCAgent
-from src.baselines.dewma import DEWMAController
-from src.baselines.kalman import KalmanR2RController
 from src.evaluation.rollout_evaluator import (
     RolloutEvaluator, SARCController, BCController,
 )
@@ -67,30 +59,6 @@ def extract_sequences(data: dict) -> list:
     return sequences
 
 
-# ── Baseline tuning on validation set ───────────────────────────────────
-# Industrial selection criterion: val_score = val_MAE + AC_WEIGHT * val_action_cost
-AC_WEIGHT = 0.0
-
-
-def tune_dewma(val_sequences, dynamics_fn, target_rr, evaluator) -> dict:
-    """Grid search lambda_0 x lambda_1 on validation sequences (joint criterion)."""
-    best_score, best_params = float("inf"), (0.5, 0.3)
-    for l0 in [0.2, 0.3, 0.5]:
-        for l1 in [0.5, 0.6, 0.7]:
-            ctrl = DEWMAController(
-                target_rr=target_rr, action_dim=ACTION_DIM,
-                lambda_0=l0, lambda_1=l1, action_bounds=NORM_BOUNDS,
-            )
-            res = evaluator.evaluate(val_sequences, dynamics_fn, ctrl, target_rr)
-            score = res["mae"] + AC_WEIGHT * res["action_cost"]
-            if score < best_score:
-                best_score = score
-                best_params = (l0, l1)
-    logger.info(f"D-EWMA tuned: lambda_0={best_params[0]}, lambda_1={best_params[1]} "
-                f"(val score={best_score:.4f})")
-    return {"lambda_0": best_params[0], "lambda_1": best_params[1]}
-
-
 # ── Main ─────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Train and evaluate SARC on CMP2")
@@ -104,7 +72,7 @@ def main():
     parser.add_argument("--bc-weight", type=float, default=0.5,
                         help="TD3+BC weight. 0=pure CQL actor loss.")
     parser.add_argument("--run-name", type=str, default=None,
-                        help="Checkpoint/result suffix. Default: ctx{context_dim}_s{seed}")
+                        help="Checkpoint/result suffix. Default: ctx{context_dim}")
     parser.add_argument("--skip-train", action="store_true",
                         help="Skip training, evaluate existing checkpoints")
     parser.add_argument("--seed", type=int, default=42,
@@ -112,10 +80,18 @@ def main():
     parser.add_argument("--lambda-s", type=float, default=0.01,
                         help="Action cost coefficient lambda_s (0=tracking-only reward)")
     parser.add_argument("--use-wm", action="store_true",
-                        help="[deprecated -- Neural World Model is always used]")
+                        help="[deprecated — Neural World Model is always used]")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--out-dir", type=str, default=None,
+                        help="Output dir for result JSON (default: RESULTS_DIR). "
+                             "Use for isolated revision runs.")
+    parser.add_argument("--ckpt-dir", type=str, default=None,
+                        help="Dir for SARC/BC/no-drift checkpoint I/O "
+                             "(default: CHECKPOINT_DIR). The world model is always "
+                             "loaded from CHECKPOINT_DIR regardless of this flag.")
     args = parser.parse_args()
 
+    # Seed for reproducibility (data splits already fixed via DataConfig.random_seed=42)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
@@ -123,6 +99,12 @@ def main():
 
     if args.run_name is None:
         args.run_name = f"ctx{args.context_dim}_s{args.seed}"
+
+    # Output isolation: default to paper-final dirs; override for revision runs.
+    out_dir = args.out_dir or RESULTS_DIR
+    ckpt_dir = args.ckpt_dir or CHECKPOINT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -188,6 +170,7 @@ def main():
         )
         return float(next_s[0, rr_start:rr_start + 4].mean())
 
+    # Sequences + evaluator
     val_sequences = extract_sequences(val_data)
     test_sequences = extract_sequences(test_data)
     logger.info(f"Val sequences: {len(val_sequences)}, Test sequences: {len(test_sequences)}")
@@ -200,11 +183,11 @@ def main():
     # ================================================================
     # 3. SARC Training
     # ================================================================
-    ckpt_path = os.path.join(CHECKPOINT_DIR, f"sarc_model_{args.run_name}.pt")
+    ckpt_path = os.path.join(ckpt_dir, f"sarc_model_{args.run_name}.pt")
     best_path = ckpt_path.replace(".pt", "_best.pt")
-    nodrift_ckpt = os.path.join(CHECKPOINT_DIR, f"sarc_no_drift_{args.run_name}.pt")
+    nodrift_ckpt = os.path.join(ckpt_dir, f"sarc_no_drift_{args.run_name}.pt")
     nodrift_best = nodrift_ckpt.replace(".pt", "_best.pt")
-    bc_ckpt = os.path.join(CHECKPOINT_DIR, f"bc_model_{args.run_name}.pt")
+    bc_ckpt = os.path.join(ckpt_dir, f"bc_model_{args.run_name}.pt")
     bc_best = bc_ckpt.replace(".pt", "_best.pt")
 
     device = args.device
@@ -268,6 +251,7 @@ def main():
                     if k in L:
                         loss_log[k].append(L[k])
 
+            # Validate every 20 epochs
             if (epoch + 1) % 20 == 0:
                 agent.actor.eval()
                 agent.drift_encoder.eval()
@@ -377,35 +361,32 @@ def main():
             state_dim=state_dim, action_dim=action_dim,
             drift_dim=drift_dim, context_dim=args.context_dim, device=device,
         )
-        _sarc_load = best_path if os.path.exists(best_path) else ckpt_path
-        if os.path.exists(_sarc_load):
-            agent.load(_sarc_load)
-            logger.info(f"Loaded: {_sarc_load}")
+        if os.path.exists(ckpt_path):
+            agent.load(ckpt_path)
+            logger.info(f"Loaded: {ckpt_path}")
         else:
-            logger.warning(f"Checkpoint not found: {best_path}")
+            logger.warning(f"Checkpoint not found: {ckpt_path}")
 
         nodrift_agent = SARCAgent(
             state_dim=state_dim, action_dim=action_dim,
             drift_dim=drift_dim, context_dim=args.context_dim,
             use_drift=False, device=device,
         )
-        _nd_load = nodrift_best if os.path.exists(nodrift_best) else nodrift_ckpt
-        if os.path.exists(_nd_load):
-            nodrift_agent.load(_nd_load)
-            logger.info(f"Loaded: {_nd_load}")
+        if os.path.exists(nodrift_ckpt):
+            nodrift_agent.load(nodrift_ckpt)
+            logger.info(f"Loaded: {nodrift_ckpt}")
         else:
-            logger.warning(f"No-drift checkpoint not found: {nodrift_best}")
+            logger.warning(f"No-drift checkpoint not found: {nodrift_ckpt}")
 
         bc_agent = BCAgent(
             state_dim=state_dim, action_dim=action_dim,
             drift_dim=drift_dim, context_dim=args.context_dim, device=device,
         )
-        _bc_load = bc_best if os.path.exists(bc_best) else bc_ckpt
-        if os.path.exists(_bc_load):
-            bc_agent.load(_bc_load)
-            logger.info(f"Loaded: {_bc_load}")
+        if os.path.exists(bc_ckpt):
+            bc_agent.load(bc_ckpt)
+            logger.info(f"Loaded: {bc_ckpt}")
         else:
-            logger.warning(f"BC checkpoint not found: {bc_best}")
+            logger.warning(f"BC checkpoint not found: {bc_ckpt}")
 
     # ================================================================
     # 4. Evaluation
@@ -414,20 +395,13 @@ def main():
     logger.info("Step 4: Evaluation (Neural WM, sequence-level)")
     logger.info("=" * 60)
 
-    dewma_params = tune_dewma(val_sequences, dynamics_fn, target_rr, evaluator)
-
+    # Sanity eval of the learned policies. All baseline comparisons
+    # (standard/age D-EWMA, Kalman) are precomputed in results/e6_grid_*.json under
+    # the matched action box; see scripts/sweep_gamma.py.
     controllers = {
         "SARC":          SARCController(agent),
         "SARC-no-drift": SARCController(nodrift_agent),
         "BC":            BCController(bc_agent),
-        "D-EWMA":        DEWMAController(
-                             target_rr=target_rr, action_dim=action_dim,
-                             lambda_0=dewma_params["lambda_0"],
-                             lambda_1=dewma_params["lambda_1"],
-                             action_bounds=NORM_BOUNDS),
-        "Kalman":        KalmanR2RController(
-                             target_rr=target_rr, action_dim=action_dim,
-                             action_bounds=NORM_BOUNDS),
     }
 
     methods = {}
@@ -452,6 +426,7 @@ def main():
         print(f"{name:<20} {m['mae']:>8.4f} {m['rmse']:>8.4f} "
               f"{m['action_cost']:>10.4f} {m['spec_violation_rate']:>10.4f}{imp}")
 
+    # Save JSON
     results = {
         "dataset": "CMP2 (private fab data)",
         "run_name": args.run_name,
@@ -461,7 +436,7 @@ def main():
         "seed": args.seed,
         "methods": methods,
     }
-    results_path = os.path.join(RESULTS_DIR, f"sarc_evaluation_{args.run_name}.json")
+    results_path = os.path.join(out_dir, f"sarc_evaluation_{args.run_name}.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     logger.info(f"Results saved: {results_path}")

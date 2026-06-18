@@ -286,7 +286,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
-    for drift_scale, tag in [(0.4, "sim_mild"), (1.0, "sim_medium"), (2.0, "sim_heavy")]:
+    for drift_scale, tag in [(0.4, "sim_mild"), (1.0, "sim_medium")]:
         logger.info(f"Generating {tag} (drift_scale={drift_scale})...")
         mdp_raw = generate_dataset(
             n_lots=400, runs_per_lot=20,

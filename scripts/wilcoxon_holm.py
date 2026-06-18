@@ -6,15 +6,13 @@ Reads the per-sequence MAE/CE arrays emitted by the patched RolloutEvaluator
 whether SARC's per-sequence metric vector is significantly lower than each
 baseline's.
 
-Deterministic baselines (D-EWMA, Kalman) have identical per-sequence
-vectors across seeds, so we use any one seed. Stochastic methods
-(SARC, BC) are averaged per-sequence across 5 seeds before testing --
-seed variance is absorbed, sequence variance drives the test (n = n_sequences).
+Learned policies (SARC, BC, SARC-no-drift) are averaged per-sequence across
+5 seeds before testing -- seed variance is absorbed, sequence variance drives
+the test (n = n_sequences). Reactive-baseline significance (D-EWMA, Kalman)
+under the matched action box is reported in stats_all.json.
 
 Holm correction is applied within each (testbed, metric) family over the
 set of baseline comparisons.
-
-For CMP1, Stage B MAE is additionally tested using per_stage.B.per_sequence_mae.
 
 Usage:
     python scripts/wilcoxon_holm.py
@@ -41,14 +39,11 @@ TESTBEDS = {
     "CMP2":       [RESULTS / f"sarc_evaluation_final_cmp2_cql1.0_s{s}.json" for s in SEEDS],
 }
 
-BASELINES = ["SARC-no-drift", "BC", "D-EWMA", "Kalman"]
+BASELINES = ["SARC-no-drift", "BC"]
 METRICS = [("MAE", "per_sequence_mae"), ("CE", "per_sequence_ce")]
 
-# Extra per-stage metrics tested only for specific testbeds.
-# Format: testbed_name -> list of (display_name, stage_key, metric_key)
-STAGE_METRICS = {
-    "CMP1": [("Stage B MAE", "B", "per_sequence_mae")],
-}
+# Per-stage metrics (none: CMP1 is reported on the combined test set).
+STAGE_METRICS = {}
 
 
 def load_per_sequence(

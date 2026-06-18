@@ -9,9 +9,9 @@ Usage:
     evaluator = RolloutEvaluator(action_bounds=NORM_BOUNDS, rr_state_idx=-1)
     controllers = {
         "SARC":          SARCController(agent),
-        "SARC-no-drift": NoDriftController(agent, context_dim),
+        "SARC-no-drift": SARCController(nodrift_agent),
         "BC":            BCController(bc_agent),
-        "D-EWMA":        DEWMAController(target_rr, action_dim, action_bounds=NORM_BOUNDS),
+        "D-EWMA":        DoubleEWMA(target_rr, action_dim, action_bounds=NORM_BOUNDS),
         "Kalman":        KalmanR2RController(target_rr, action_dim, action_bounds=NORM_BOUNDS),
     }
     for name, ctrl in controllers.items():
@@ -92,50 +92,6 @@ class BCController(BaseController):
 
     def predict_action(self, state: np.ndarray, drift: np.ndarray) -> np.ndarray:
         return self.agent.select_action(state, drift)
-
-
-class GatedSARCController(BaseController):
-    """
-    SARC with Mahalanobis-distance gate.
-
-    Blends SARC action with a D-EWMA fallback based on how novel the
-    current drift context is relative to the training distribution.
-
-        alpha = sigmoid(-sharpness * (distance - threshold))
-
-    High distance (OOD drift) → low alpha → more D-EWMA.
-    Low distance  (familiar)  → high alpha → pure SARC.
-
-    threshold and sharpness are calibrated from validation-set distances:
-        threshold = percentile(val_distances, pct)
-        sharpness = 1 / std(val_distances)
-    """
-
-    def __init__(self, agent, dewma_controller, threshold: float, sharpness: float):
-        self.agent = agent
-        self.dewma = dewma_controller
-        self.threshold = threshold
-        self.sharpness = sharpness
-
-    def reset(self):
-        self.dewma.reset()
-
-    def predict_action(self, state: np.ndarray, drift: np.ndarray) -> np.ndarray:
-        self.agent.actor.eval()
-        if self.agent.drift_encoder is not None:
-            self.agent.drift_encoder.eval()
-
-        a_rl   = self.agent.select_action(state, drift)
-        a_ewma = self.dewma.predict_action(state)
-
-        dist  = self.agent.compute_context_distance(drift)
-        z     = -self.sharpness * (dist - self.threshold)
-        alpha = 1.0 / (1.0 + np.exp(-np.clip(z, -20, 20)))
-
-        return alpha * a_rl + (1.0 - alpha) * a_ewma
-
-    def update(self, rr: float, action: np.ndarray):
-        self.dewma.update(rr, action)
 
 
 # ============================================================

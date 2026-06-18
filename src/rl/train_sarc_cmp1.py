@@ -6,7 +6,7 @@ State: 13D (wear_last x6 + process_mean x6 + prev_RR x1)
 Action: 6D (zone pressures)
 Drift: 13D (wear x6 + delta_wear x6 + lot_position x1)
 
-Evaluation uses a Neural World Model (5-ensemble) trained on CMP1 training data
+Evaluation uses a linear dynamics proxy trained on CMP1 training data
 to simulate RR outcomes for each controller on test sequences.
 
 Paper final CMP1: cql_alpha=5.0, bc_weight=0.5, context_dim=2,
@@ -30,8 +30,6 @@ from src.data.preprocess_cmp1_r2r import preprocess_cmp1_r2r
 from src.data.mdp_dataset import split_data, chrono_split_data, save_dataset
 from src.rl.sarc_agent import SARCAgent
 from src.rl.bc_agent import BCAgent
-from src.baselines.dewma import DEWMAController
-from src.baselines.kalman import KalmanR2RController
 from src.evaluation.noise_models import build_noise_model, prefetch_noise
 from src.evaluation.rollout_evaluator import (
     RolloutEvaluator, SARCController, BCController,
@@ -53,33 +51,6 @@ NORM_BOUNDS = (np.full(ACTION_DIM, -3.0), np.full(ACTION_DIM, 3.0))
 
 
 # ============================================================
-# Baseline hyperparameter tuning on validation set
-# Industrial selection criterion: val_MAE + AC_WEIGHT * val_action_cost.
-# ============================================================
-AC_WEIGHT = 0.0
-
-
-def tune_dewma(val_sequences, dynamics_fn, target_rr_norm, evaluator) -> dict:
-    """Grid search lambda_0 x lambda_1 for D-EWMA (joint criterion)."""
-    best_score, best_params = float("inf"), (0.5, 0.3)
-    logger.info("Tuning D-EWMA lambdas on validation set ...")
-    for l0 in [0.2, 0.3, 0.5]:
-        for l1 in [0.5, 0.6, 0.7]:
-            ctrl = DEWMAController(
-                target_rr=target_rr_norm, action_dim=ACTION_DIM,
-                lambda_0=l0, lambda_1=l1, action_bounds=NORM_BOUNDS,
-            )
-            res = evaluator.evaluate(val_sequences, dynamics_fn, ctrl, target_rr_norm)
-            score = res["mae"] + AC_WEIGHT * res["action_cost"]
-            if score < best_score:
-                best_score = score
-                best_params = (l0, l1)
-    logger.info(f"Best D-EWMA: lambda_0={best_params[0]}, lambda_1={best_params[1]} "
-                f"(val score={best_score:.4f})")
-    return {"lambda_0": best_params[0], "lambda_1": best_params[1]}
-
-
-# ============================================================
 # Step 2: Extract test sequences
 # ============================================================
 
@@ -87,6 +58,9 @@ def extract_test_sequences(test_data: dict):
     """
     Group test transitions into sequences using terminal flags.
     Each sequence dict includes 'stage' (0=A, 1=B) from the first transition.
+
+    Returns:
+        List of dicts, each with observations, actions, drift_features, next_observations, stage.
     """
     terminals = test_data["terminals"]
     has_stage = "stage_labels" in test_data
@@ -131,12 +105,17 @@ def evaluate_controller(
         dynamics_fn: Callable(state, action) -> rr_next (float).
         get_action_fn: Callable(state, drift) -> normalized action (6D).
         target_rr_normalized: Target RR in normalized units (0.0 = dataset mean).
+
+    Returns:
+        Dict of metrics.
     """
     all_rr_errors = []
     all_action_diffs = []
     spec_violations = 0
     total_steps = 0
 
+    # Spec margin in normalized units: CMP1 RR std is empirical
+    # We track |error| > 1.0 normalized unit as spec violation (conservative)
     SPEC_MARGIN_NORM = 1.0
 
     for seq in sequences:
@@ -152,6 +131,7 @@ def evaluate_controller(
             action = get_action_fn(state, d)
             action = np.clip(action, NORM_BOUNDS[0], NORM_BOUNDS[1])
 
+            # Simulate RR via dynamics model
             rr_next = dynamics_fn(state, action)
 
             rr_error = abs(rr_next - target_rr_normalized)
@@ -161,10 +141,12 @@ def evaluate_controller(
                 spec_violations += 1
             total_steps += 1
 
+            # Action smoothness (change from previous)
             if prev_action is not None:
                 all_action_diffs.append(np.mean(np.abs(action - prev_action)))
             prev_action = action.copy()
 
+            # Advance state: update prev_RR with simulated RR
             if t + 1 < T:
                 next_state = seq["next_observations"][t].copy()
                 next_state[RR_STATE_IDX] = rr_next  # inject simulated RR
@@ -197,6 +179,11 @@ def main():
     parser.add_argument("--bc-weight", type=float, default=0.5,
                         help="Behavioral cloning weight for actor loss (TD3+BC). 0=pure CQL.")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--out-dir", type=str, default=None,
+                        help="Output dir for result JSON (default: RESULTS_DIR). Revision isolation.")
+    parser.add_argument("--ckpt-dir", type=str, default=None,
+                        help="Dir for checkpoint I/O (default: RESULTS_DIR/checkpoints). "
+                             "World model is always loaded from CHECKPOINT_DIR.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     parser.add_argument("--skip-train", action="store_true",
@@ -213,7 +200,7 @@ def main():
                         help="Re-train only the SARC-no-drift (use_drift=False) ablation. "
                              "Skips main SARC/BC; patches the existing JSON's SARC-no-drift entries.")
     parser.add_argument("--use-wm", action="store_true",
-                        help="[deprecated -- Neural World Model is always used]")
+                        help="[deprecated — Neural World Model is always used]")
     parser.add_argument("--noise-type", type=str, default="none",
                         choices=["none", "ima", "arima"],
                         help="Noise disturbance model added to simulated RR (default: none)")
@@ -224,16 +211,21 @@ def main():
     parser.add_argument("--noise-seed", type=int, default=42,
                         help="Random seed for pre-generating noise sequence")
     parser.add_argument("--train-noise-scale", type=float, default=0.0,
-                        help="Gaussian noise sigma added to RR dim during CQL training. 0=disabled.")
+                        help="Gaussian noise sigma added to RR dim during CQL training (data augmentation). "
+                             "Teaches policy to rely on drift features over noisy RR. 0=disabled.")
     parser.add_argument("--chrono-split", action="store_true",
                         help="Chronological lot split (early lots->train, late lots->test). "
                              "Tests distribution shift generalization under increasing equipment wear.")
     parser.add_argument("--cross-lot", action="store_true",
-                        help="Cross-lot sequences: group by (STAGE, CHAMBER) across all 185 lots.")
+                        help="Cross-lot sequences: group by (STAGE, CHAMBER) across all 185 lots "
+                             "to build ~9 sequences of avg 661 steps. "
+                             "Mirrors CMP2 sequence length (22 steps) to give DriftEncoder "
+                             "enough context for cumulative wear tracking.")
     parser.add_argument("--lambda-s", type=float, default=0.01,
                         help="Action smoothness weight in reward (default: 0.01)")
     args = parser.parse_args()
 
+    # Seed for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
@@ -243,6 +235,12 @@ def main():
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # Output isolation: default to paper-final dirs; override for revision runs.
+    out_dir = args.out_dir or RESULTS_DIR
+    ckpt_dir = args.ckpt_dir or os.path.join(RESULTS_DIR, "checkpoints")
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     # ============================================================
     # 1. Preprocess CMP1
@@ -261,6 +259,7 @@ def main():
     else:
         train_data, val_data, test_data = split_data(mdp_data)
 
+    # Re-seed after split_data (which internally resets to seed=42)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -269,6 +268,7 @@ def main():
                 f"Test: {len(test_data['observations'])}")
     logger.info(f"State: {STATE_DIM}D, Action: {ACTION_DIM}D, Drift: {DRIFT_DIM}D")
 
+    # Save CMP1 datasets
     save_dataset(train_data, {"state": s_scaler, "action": a_scaler}, target_rr_dict, "cmp1_train")
     save_dataset(val_data, {}, target_rr_dict, "cmp1_val")
     save_dataset(test_data, {}, target_rr_dict, "cmp1_test")
@@ -280,6 +280,7 @@ def main():
     logger.info("Step 2: Load Neural World Model (for offline eval)")
     logger.info("=" * 60)
 
+    # Target RR in normalized space = 0.0 (dataset mean after StandardScaler)
     target_rr_norm = 0.0
 
     wm_ckpt = os.path.join(CHECKPOINT_DIR, "world_model_cmp1_best.pt")
@@ -301,13 +302,15 @@ def main():
         )
         return float(next_s[0, RR_STATE_IDX])
 
+    # Noise injection: pre-generate fixed sequence so all controllers see same disturbance
     noise_model = build_noise_model(
         args.noise_type, args.noise_scale, args.noise_reset_interval
     )
     if noise_model is not None:
+        # Count total test steps to pre-generate noise
         _total_test_steps = sum(len(s["observations"]) for s in extract_test_sequences(test_data))
         _noise_seq = prefetch_noise(noise_model, _total_test_steps + 1000, seed=args.noise_seed)
-        _noise_idx = [0]
+        _noise_idx = [0]  # mutable counter (shared across all evaluators)
 
         def dynamics_fn(state, action):
             rr = _base_dynamics(state, action)
@@ -331,13 +334,14 @@ def main():
 
     # ============================================================
     # Short-circuit: --only-nodrift path
+    # Train SARC-no-drift (use_drift=False) ablation only, patch existing JSON
     # ============================================================
     if args.only_nodrift:
         logger.info("=" * 60)
         logger.info("[--only-nodrift] Re-train SARC-no-drift ablation (use_drift=False)")
         logger.info("=" * 60)
 
-        save_dir = os.path.join(RESULTS_DIR, "checkpoints")
+        save_dir = ckpt_dir
         os.makedirs(save_dir, exist_ok=True)
         suffix = args.model_suffix
         if args.seed != 42 or "_s" in suffix:
@@ -418,7 +422,7 @@ def main():
                     seqs, dynamics_fn, nd_ctrl, target_rr_norm, _reset_noise,
                 )
 
-        results_path = os.path.join(RESULTS_DIR, f"cmp1_evaluation{suffix}.json")
+        results_path = os.path.join(out_dir, f"cmp1_evaluation{suffix}.json")
         if not os.path.exists(results_path):
             raise FileNotFoundError(
                 f"Expected existing JSON {results_path} to patch. "
@@ -447,6 +451,8 @@ def main():
     # ============================================================
     # 3. Create SARC Agent
     # ============================================================
+    # --raw-drift: bypass encoder, use 13D drift directly as context
+    # Normalize drift features (fair comparison: same scale as encoder output)
     from sklearn.preprocessing import StandardScaler
     drift_scaler = None
     if args.raw_drift:
@@ -474,11 +480,12 @@ def main():
         device=args.device,
     )
 
+    # --raw-drift: replace DriftEncoder with identity (drift features used as-is)
     if args.raw_drift:
         agent.drift_encoder = torch.nn.Identity()
         logger.info("Raw drift mode: DriftEncoder replaced with Identity (13D pass-through)")
 
-    save_dir = os.path.join(RESULTS_DIR, "checkpoints")
+    save_dir = ckpt_dir
     os.makedirs(save_dir, exist_ok=True)
     suffix = args.model_suffix
     if args.seed != 42 or "_s" in suffix:
@@ -488,6 +495,7 @@ def main():
     nodrift_best_model_path = nodrift_model_path.replace(".pt", "_best.pt")
     bc_model_path = os.path.join(save_dir, f"bc_cmp1_model{suffix}.pt")
 
+    # --- BC Agent (same architecture as SARC actor+encoder, no critic) ---
     bc_agent = BCAgent(
         state_dim=STATE_DIM,
         action_dim=ACTION_DIM,
@@ -503,6 +511,7 @@ def main():
     if args.raw_drift:
         bc_agent.drift_encoder = None
 
+    # --- SARC-no-drift agent (use_drift=False): proper ablation, separately trained ---
     no_drift_agent = SARCAgent(
         state_dim=STATE_DIM, action_dim=ACTION_DIM, drift_dim=DRIFT_DIM,
         context_dim=args.context_dim, lr_actor=args.lr, lr_critic=args.lr,
@@ -510,20 +519,15 @@ def main():
         bc_weight=args.bc_weight, use_drift=False, device=args.device,
     )
 
-    _sarc_best = cmp1_model_path.replace(".pt", "_best.pt")
-    _bc_best   = bc_model_path.replace(".pt", "_best.pt")
-    if args.skip_train and (os.path.exists(cmp1_model_path) or os.path.exists(_sarc_best)):
-        _load = _sarc_best if os.path.exists(_sarc_best) else cmp1_model_path
-        logger.info(f"Loading existing CMP1 model from {_load}")
-        agent.load(_load)
-        _bc_load = _bc_best if os.path.exists(_bc_best) else bc_model_path
-        if os.path.exists(_bc_load):
-            logger.info(f"Loading existing BC model from {_bc_load}")
-            bc_agent.load(_bc_load)
-        _nd_load = nodrift_best_model_path if os.path.exists(nodrift_best_model_path) else nodrift_model_path
-        if os.path.exists(_nd_load):
-            logger.info(f"Loading existing no-drift model from {_nd_load}")
-            no_drift_agent.load(_nd_load)
+    if args.skip_train and os.path.exists(cmp1_model_path):
+        logger.info(f"Loading existing CMP1 model from {cmp1_model_path}")
+        agent.load(cmp1_model_path)
+        if os.path.exists(bc_model_path):
+            logger.info(f"Loading existing BC model from {bc_model_path}")
+            bc_agent.load(bc_model_path)
+        if os.path.exists(nodrift_model_path):
+            logger.info(f"Loading existing no-drift model from {nodrift_model_path}")
+            no_drift_agent.load(nodrift_model_path)
     else:
         # ============================================================
         # 4. Pre-train Drift Encoder (1D RR prediction for CMP1)
@@ -541,6 +545,7 @@ def main():
             logger.info("Step 3: Pre-train Drift Encoder (1D RR auxiliary task)")
             logger.info("=" * 60)
 
+            # CMP1: prev_RR is the last 1 dim of state
             train_drift = torch.FloatTensor(train_data["drift_features"])
             train_rr = torch.FloatTensor(train_data["observations"][:, -1:])  # (N, 1)
 
@@ -570,8 +575,10 @@ def main():
         best_val_mae = float("inf")
         best_model_path = cmp1_model_path.replace(".pt", f"_best.pt")
 
+        # Val sequences for early stopping
         val_sequences = extract_test_sequences(val_data)
 
+        # Proxy eval function for validation (no statefulness needed)
         def _sarc_action_fn(s, d):
             with torch.no_grad():
                 st = torch.FloatTensor(s).unsqueeze(0).to(agent.device)
@@ -591,12 +598,14 @@ def main():
                 if len(idx) < 8:
                     continue
 
+                # RR observation noise augmentation: teaches policy to rely on
+                # DriftEncoder (clean wear features) rather than noisy prev_RR
                 if args.train_noise_scale > 0.0:
                     s_aug = states[idx].clone()
                     ns_aug = next_states[idx].clone()
                     rr_noise = torch.randn(len(idx), device=agent.device) * args.train_noise_scale
                     s_aug[:, RR_STATE_IDX]  += rr_noise
-                    ns_aug[:, RR_STATE_IDX] += rr_noise
+                    ns_aug[:, RR_STATE_IDX] += rr_noise  # same noise = correlated observation
                     batch_states      = s_aug
                     batch_next_states = ns_aug
                 else:
@@ -612,6 +621,7 @@ def main():
                     if k in losses:
                         epoch_losses[k].append(losses[k])
 
+            # Validate every 20 epochs and save best model (unless --no-early-stop)
             if (epoch + 1) % 20 == 0:
                 agent.actor.eval()
                 agent.drift_encoder.eval()
@@ -632,6 +642,7 @@ def main():
                 logger.info(f"Epoch {epoch+1}/{args.epochs} | "
                             f"Critic: {crit:.4f} | Actor: {act:.4f} | CQL: {cql:.4f}")
 
+        # Load best model if early stopping was enabled and a best model was saved
         if not args.no_early_stop and os.path.exists(best_model_path):
             logger.info(f"Loading best CMP1 model (val MAE={best_val_mae:.4f})")
             agent.load(best_model_path)
@@ -640,6 +651,8 @@ def main():
 
         # ============================================================
         # Step 4a: SARC-no-drift Ablation (use_drift=False, separately trained)
+        # Proper ablation: actor does not see drift context at train or eval time.
+        # Mirrors the structure of CMP2 (train_sarc.py) and Sim (train_sarc_sim.py).
         # ============================================================
         logger.info("=" * 60)
         logger.info("Step 4a: SARC-no-drift Training (use_drift=False)")
@@ -678,12 +691,13 @@ def main():
         logger.info(f"CMP1 SARC-no-drift model saved to {nodrift_model_path}")
 
         # ============================================================
-        # BC Training
+        # BC Training (after SARC, reuse same data tensors)
         # ============================================================
         logger.info("=" * 60)
         logger.info("Step 4b: BC Training on CMP1 (MSE imitation)")
         logger.info("=" * 60)
 
+        # Optionally pre-train BC encoder same as SARC
         if not args.raw_drift and not args.no_pretrain:
             bc_agent.pretrain_encoder(
                 torch.FloatTensor(train_data["drift_features"]),
@@ -736,18 +750,14 @@ def main():
 
     evaluator = RolloutEvaluator(NORM_BOUNDS, rr_state_idx=RR_STATE_IDX)
 
+    # Sanity eval of the learned policies. Baseline comparisons (standard/age
+    # D-EWMA, Kalman) are precomputed in results/e6_grid_*.json (see scripts/sweep_gamma.py).
     val_sequences = extract_test_sequences(val_data)
-    dewma_params = tune_dewma(val_sequences, dynamics_fn, target_rr_norm, evaluator)
 
     controllers = {
         "SARC":          SARCController(agent),
         "SARC-no-drift": SARCController(no_drift_agent),
         "BC":            BCController(bc_agent),
-        "D-EWMA":        DEWMAController(target_rr_norm, ACTION_DIM,
-                                         lambda_0=dewma_params["lambda_0"],
-                                         lambda_1=dewma_params["lambda_1"],
-                                         action_bounds=NORM_BOUNDS),
-        "Kalman":        KalmanR2RController(target_rr_norm, action_dim=ACTION_DIM, action_bounds=NORM_BOUNDS),
     }
 
     results_methods = {}
@@ -772,6 +782,7 @@ def main():
         "methods": results_methods,
     }
 
+    # ---- per-stage breakdown ----
     stage_seqs = {
         "A": [s for s in test_sequences if s.get("stage", -1) == 0],
         "B": [s for s in test_sequences if s.get("stage", -1) == 1],
@@ -787,6 +798,7 @@ def main():
             per_stage[stage_name] = stage_res
         results["per_stage"] = per_stage
 
+    dyn_tag = "WM"
     if args.cross_lot:
         split_tag = "Cross-Lot Sequences"
     elif args.chrono_split:
@@ -794,7 +806,7 @@ def main():
     else:
         split_tag = "Random Split"
     print("\n" + "=" * 70)
-    print(f"CMP1 Evaluation Results (WM Simulation, {split_tag})")
+    print(f"CMP1 Evaluation Results ({dyn_tag} Simulation, {split_tag})")
     print("=" * 70)
     print(f"{'Method':<20} {'MAE':>8} {'RMSE':>8} {'Act.Cost':>10} {'Spec Viol.':>12}")
     print("-" * 70)
@@ -820,9 +832,10 @@ def main():
                     imp = f"  [SARC -{pct:.1f}%]"
                 print(f"{mname:<20} {m['mae']:>8.4f} {m['rmse']:>8.4f} {m['action_cost']:>10.4f}{imp}")
 
-    print("\n(MAE/RMSE in normalized RR units; Action Cost = mean |Delta_a| per step)")
+    print("\n(MAE/RMSE in normalized RR units; Action Cost = mean |Da| per step)")
 
-    results_path = os.path.join(RESULTS_DIR, f"cmp1_evaluation{suffix}.json")
+    # Save results
+    results_path = os.path.join(out_dir, f"cmp1_evaluation{suffix}.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     logger.info(f"Results saved to {results_path}")

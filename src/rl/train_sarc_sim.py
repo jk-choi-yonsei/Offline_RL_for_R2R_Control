@@ -1,15 +1,16 @@
 """
-Preston CMP Simulator-based SARC Training and Evaluation.
+SARC training and evaluation on the Preston CMP simulator.
 
 Follows the same structure as train_sarc_cmp1.py:
-  - Evaluation: PrestonRolloutEvaluator -- CMPSimulator ground-truth rollout
-  - STATE_DIM=7, ACTION_DIM=6, DRIFT_DIM=9
-  - drift_scale argument supports mild/medium/heavy conditions
+  - Evaluation: PrestonRolloutEvaluator — ground-truth rollout on CMPSimulator
+    (the earlier linear proxy dynamics_fn is removed; it dropped wear-dependent k_p)
+  - STATE_DIM=5, ACTION_DIM=5, DRIFT_DIM=9
+  - drift_scale argument selects the mild and medium conditions
   - Results saved to: results/sim_evaluation_{tag}.json
 
-Usage:
-  python src/rl/train_sarc_sim.py --drift-scale 1.0   # mild
-  python src/rl/train_sarc_sim.py --drift-scale 2.0   # medium
+Examples:
+  python src/rl/train_sarc_sim.py --drift-scale 0.4   # mild
+  python src/rl/train_sarc_sim.py --drift-scale 1.0   # medium
 
 Paper final Sim (mild/medium): cql_alpha=1.0, bc_weight=0.5, context_dim=2,
 pretrain=80, CQL=200, lr=1e-4, batch=256, seeds [123,789,1024,2024,7777].
@@ -32,8 +33,6 @@ from src.data.generate_sim_dataset import generate_dataset, normalize_and_split
 from src.data.mdp_dataset import save_dataset
 from src.rl.sarc_agent import SARCAgent
 from src.rl.bc_agent import BCAgent
-from src.baselines.dewma import DEWMAController
-from src.baselines.kalman import KalmanR2RController
 from src.evaluation.rollout_evaluator import (
     SARCController, BCController,
 )
@@ -53,7 +52,7 @@ RUNS_PER_LOT = 20
 NORM_BOUNDS = (np.full(ACTION_DIM, -3.0), np.full(ACTION_DIM, 3.0))
 
 
-# ── Sequence extraction ───────────────────────────────────────────────────
+# ── Sequence extraction ──────────────────────────────────────────────────
 def extract_test_sequences(test_data: dict) -> list:
     terminals = test_data["terminals"]
     n = len(terminals)
@@ -71,37 +70,11 @@ def extract_test_sequences(test_data: dict) -> list:
     return sequences
 
 
-# ── Baseline tuning on validation set (joint MAE + action cost) ──────────
-AC_WEIGHT = 0.0  # industrial-scale action cost penalty; see train_sarc.py for rationale
-
-
-def tune_dewma(val_sequences, evaluator: PrestonRolloutEvaluator, target_rr_norm=0.0) -> dict:
-    """Grid search lambda_0 x lambda_1 on validation sequences (joint criterion)."""
-    best_score, best_params = float("inf"), (0.5, 0.3)
-    logger.info("Tuning D-EWMA lambdas on validation set ...")
-    for l0 in [0.2, 0.3, 0.5]:
-        for l1 in [0.5, 0.6, 0.7]:
-            ctrl = DEWMAController(
-                target_rr=target_rr_norm, action_dim=ACTION_DIM,
-                lambda_0=l0, lambda_1=l1, action_bounds=NORM_BOUNDS,
-            )
-            res = evaluator.evaluate(val_sequences, ctrl, target_rr_norm)
-            score = res["mae"] + AC_WEIGHT * res["action_cost"]
-            if score < best_score:
-                best_score = score
-                best_params = (l0, l1)
-    logger.info(
-        f"Best D-EWMA: lambda_0={best_params[0]}, lambda_1={best_params[1]} "
-        f"(val score={best_score:.4f})"
-    )
-    return {"lambda_0": best_params[0], "lambda_1": best_params[1]}
-
-
 # ── Main ──────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Train and evaluate SARC on CMP simulator")
     parser.add_argument("--drift-scale", type=float, default=1.0,
-                        help="Drift intensity: mild=1.0, medium=2.0")
+                        help="Drift intensity: mild=0.4, medium=1.0")
     parser.add_argument("--tag", type=str, default="",
                         help="Result file suffix (auto-set from drift-scale if empty)")
     parser.add_argument("--epochs",          type=int,   default=200)
@@ -123,6 +96,7 @@ def main():
                         help="Skip SARC training, load existing checkpoint")
     args = parser.parse_args()
 
+    # Seed for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
@@ -135,19 +109,24 @@ def main():
 
     # auto-tag: base tag for data files (seed-independent)
     if not args.tag:
-        if args.drift_scale <= 0.5:  args.tag = "sim_mild"
-        else:                        args.tag = "sim_medium"
-    args.tag = f"{args.tag}_cql{args.cql_alpha}"  # include cql_alpha in tag (matches checkpoint naming)
+        if args.drift_scale <= 0.5:    args.tag = "sim_mild"
+        elif args.drift_scale <= 1.2:  args.tag = "sim_medium"
+        else:
+            raise ValueError(
+                "Paper uses mild (0.4) and medium (1.0); pass --tag for other scales."
+            )
+    # Append lambda_s to tag when non-default (forces data regeneration with new rewards)
     if args.lambda_s != 0.01:
         args.tag = f"{args.tag}_ls{args.lambda_s}"
-    base_tag = args.tag
-    tag = f"{base_tag}_s{args.seed}" if args.seed != 42 else base_tag
+    base_tag = args.tag          # data files: sim_mild, sim_medium (shared across seeds)
+    tag = f"{base_tag}_s{args.seed}" if args.seed != 42 else base_tag  # results/ckpt tag
 
-    # ── 1. Data generation ────────────────────────────────────────────────
+    # ── 1. Data generation ───────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info(f"Step 1: Dataset  tag={tag}  drift_scale={args.drift_scale}")
     logger.info("=" * 60)
 
+    # Data uses base_tag (shared across seeds); results/ckpts use tag (seed-specific)
     train_path = os.path.join(RESULTS_DIR, "data", f"{base_tag}_train_observations.npy")
     if os.path.exists(train_path):
         logger.info(f"Loading existing dataset: {base_tag}")
@@ -193,6 +172,10 @@ def main():
     )
 
     # ── 2. Preston ground-truth evaluator ─────────────────────────────────
+    # Evaluation uses the Preston simulator itself (NOT a learned proxy).
+    # Each test sequence is rolled out on a fresh CMPSimulator whose initial
+    # wear / wear-rate / lot-position are inverse-transformed from the
+    # sequence's first drift_features vector.
     logger.info("Step 2: Instantiate Preston ground-truth evaluator")
     sim_cfg = SimConfig(drift_scale=args.drift_scale, seed=42)
     preston_evaluator = PrestonRolloutEvaluator(
@@ -206,7 +189,7 @@ def main():
 
     target_rr_norm = 0.0  # target = 0 in normalized space
 
-    # ── 3. SARC Agent ──────────────────────────────────────────────────
+    # ── 3. SARC agent ─────────────────────────────────────────────────────
     agent = SARCAgent(
         state_dim=STATE_DIM,
         action_dim=ACTION_DIM,
@@ -232,32 +215,27 @@ def main():
         bc_weight=args.bc_weight, use_drift=False, device=args.device,
     )
 
-    no_drift_ckpt = ckpt_path.replace(".pt", "_nodrift.pt")
-    no_drift_best = ckpt_path.replace(".pt", "_nodrift_best.pt")
-    bc_ckpt = ckpt_path.replace(".pt", "_bc.pt")
-    bc_best = ckpt_path.replace(".pt", "_bc_best.pt")
-
-    if args.skip_train and (os.path.exists(ckpt_path) or os.path.exists(best_path)):
-        _load = best_path if os.path.exists(best_path) else ckpt_path
-        logger.info(f"Loading existing model: {_load}")
-        agent.load(_load)
-
-        _nd_load = no_drift_best if os.path.exists(no_drift_best) else no_drift_ckpt
-        if os.path.exists(_nd_load):
-            no_drift_agent.load(_nd_load)
+    if args.skip_train and os.path.exists(ckpt_path):
+        logger.info(f"Loading existing model: {ckpt_path}")
+        agent.load(ckpt_path)
+        no_drift_ckpt = ckpt_path.replace(".pt", "_nodrift.pt")
+        if os.path.exists(no_drift_ckpt):
+            logger.info(f"Loading existing no-drift model: {no_drift_ckpt}")
+            no_drift_agent.load(no_drift_ckpt)
         else:
-            logger.warning(f"No-drift checkpoint not found: {no_drift_best}. Using random init.")
+            logger.warning(f"No-drift checkpoint not found: {no_drift_ckpt}. Using random init.")
 
         bc_agent = BCAgent(
             state_dim=STATE_DIM, action_dim=ACTION_DIM,
             drift_dim=DRIFT_DIM, context_dim=args.context_dim,
             rr_out_dim=RR_OUT_DIM, device=args.device,
         )
-        _bc_load = bc_best if os.path.exists(bc_best) else bc_ckpt
-        if os.path.exists(_bc_load):
-            bc_agent.load(_bc_load)
+        bc_ckpt = ckpt_path.replace(".pt", "_bc.pt")
+        if os.path.exists(bc_ckpt):
+            logger.info(f"Loading existing BC model: {bc_ckpt}")
+            bc_agent.load(bc_ckpt)
         else:
-            logger.warning(f"BC checkpoint not found: {bc_best}. Using random init.")
+            logger.warning(f"BC checkpoint not found: {bc_ckpt}. Using random init.")
 
     else:
         # ── 4. DriftEncoder Pretrain ──────────────────────────────────────
@@ -327,7 +305,7 @@ def main():
         agent.save(ckpt_path)
         logger.info(f"Model saved: {ckpt_path}")
 
-        # ── SARC-no-drift ablation (use_drift=False) ──────────────────────
+        # ── no-drift ablation agent (proper: use_drift=False) ─────────────────
         logger.info("Step 5b: Train SARC-no-drift ablation (use_drift=False)")
         no_drift_agent = SARCAgent(
             state_dim=STATE_DIM, action_dim=ACTION_DIM, drift_dim=DRIFT_DIM,
@@ -339,6 +317,7 @@ def main():
         no_drift_best = no_drift_ckpt.replace(".pt", "_best.pt")
 
         best_nd_mae = float("inf")
+        dev = no_drift_agent.device
         for epoch in range(args.epochs):
             no_drift_agent.actor.train()
             idx = np.random.permutation(n_samples)
@@ -397,22 +376,15 @@ def main():
         bc_agent.save(bc_ckpt)
 
     # ── 6. Evaluation ─────────────────────────────────────────────────────
-    logger.info("Step 5: Evaluate all methods on test sequences (Preston ground truth)")
+    logger.info("Step 5: Evaluate learned policies on test sequences (Preston ground truth)")
     test_sequences = extract_test_sequences(test_data)
-    dewma_params = tune_dewma(val_sequences, preston_evaluator, target_rr_norm)
-    logger.info(f"D-EWMA tuned: lambda_0={dewma_params['lambda_0']}, lambda_1={dewma_params['lambda_1']}")
 
+    # Sanity eval of the learned policies. Baseline comparisons (standard/age
+    # D-EWMA, Kalman) are precomputed in results/e6_grid_*.json (see scripts/sweep_gamma.py).
     controllers = {
         "SARC":          SARCController(agent),
         "SARC-no-drift": SARCController(no_drift_agent),
         "BC":            BCController(bc_agent),
-        "D-EWMA":        DEWMAController(
-                             target_rr=target_rr_norm, action_dim=ACTION_DIM,
-                             lambda_0=dewma_params["lambda_0"],
-                             lambda_1=dewma_params["lambda_1"],
-                             action_bounds=NORM_BOUNDS),
-        "Kalman":        KalmanR2RController(target_rr=target_rr_norm, action_dim=ACTION_DIM,
-                             action_bounds=NORM_BOUNDS),
     }
 
     methods = {}

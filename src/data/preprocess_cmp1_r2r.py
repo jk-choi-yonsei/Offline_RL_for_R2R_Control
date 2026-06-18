@@ -1,29 +1,28 @@
 """
 CMP1 R2R Control Preprocessing Pipeline.
 
-Converts CMP1 (public PHM dataset) into MDP tuples for R2R control.
+Transforms CMP1 (public PHM dataset) into MDP tuples for R2R control.
 
 Data structure:
-  - One file = 1 LOT (multiple wafers)
+  - One file = one LOT (contains multiple wafers)
   - Each row = one timestamp during polishing (~111 rows per wafer)
   - (WAFER_ID, STAGE, CHAMBER) = one polishing run
-  - R2R sequence: consecutive wafers in chronological order within the same
-    (lot_file, STAGE, CHAMBER)
+  - R2R sequence: time-ordered consecutive wafers within the same (lot_file, STAGE, CHAMBER)
 
 State (13D):
   - Wear (6): last value of USAGE_OF_* (cumulative usage)
-  - Process (6): mean slurry/rotation values
-  - prev_RR (1): removal rate from the previous run
+  - Process (6): slurry/rotation means
+  - prev_RR (1): removal rate of the previous run
 
-Action (6D): pressure setpoints applied to run t+1 (R2R control decision)
+Action (6D): pressure setpoints applied at run t+1 (the R2R control decision)
   - PRESSURIZED_CHAMBER, MAIN_OUTER_AIR_BAG, CENTER_AIR_BAG,
     RETAINER_RING, RIPPLE_AIR_BAG, EDGE_AIR_BAG pressure (mean of run t+1)
-  -> reward = f(RR_{t+1}): outcome of that action
+  -> reward = f(RR_{t+1}): the outcome of that action
 
 Drift (13D):
   - Wear (6): absolute values
-  - Delta wear (6): change relative to previous run
-  - lot_position (1): position within lot, normalized to [0, 1]
+  - Delta wear (6): change from the previous run
+  - lot_position (1): position within the lot, 0~1
 """
 
 import os
@@ -70,24 +69,24 @@ PROCESS_COLS = [
     "HEAD_ROTATION",
 ]
 
-RR_OUTLIER_THRESHOLD = 500.0  # exclude AVG_REMOVAL_RATE > 500
+RR_OUTLIER_THRESHOLD = 500.0  # drop AVG_REMOVAL_RATE > 500
 
 
 # ============================================================
-# Step 1: Aggregate each lot file by run
+# Step 1: Aggregate each lot file into runs
 # ============================================================
 
 def aggregate_runs_from_file(filepath: str, file_id: int) -> pd.DataFrame:
     """
-    Aggregate one lot file into per-run rows grouped by (WAFER_ID, STAGE, CHAMBER).
+    Aggregate one lot file by (WAFER_ID, STAGE, CHAMBER).
 
     Returns:
-        DataFrame where each row is one polishing run.
+        DataFrame where each row = one polishing run.
         Columns: wear_last, pressure_mean, process_mean, first_timestamp, ...
     """
     df = pd.read_csv(filepath)
 
-    # numeric conversion
+    # Convert to numeric
     for col in WEAR_COLS + PRESSURE_COLS + PROCESS_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -107,7 +106,7 @@ def aggregate_runs_from_file(filepath: str, file_id: int) -> pd.DataFrame:
             if col in group.columns:
                 rec[f"{col}_last"] = group[col].dropna().iloc[-1] if group[col].notna().any() else np.nan
 
-        # Pressure & Process: mean value (setting during run)
+        # Pressure & Process: mean values (setpoints during the run)
         for col in PRESSURE_COLS + PROCESS_COLS:
             if col in group.columns:
                 rec[f"{col}_mean"] = group[col].mean()
@@ -118,7 +117,9 @@ def aggregate_runs_from_file(filepath: str, file_id: int) -> pd.DataFrame:
 
 
 def load_all_runs(split: str = "training") -> pd.DataFrame:
-    """Load and aggregate all lot files into per-run rows."""
+    """
+    Load all lot files and aggregate into runs.
+    """
     data_dir = os.path.join(CMP1_DIR, "CMP-data", split)
     files = sorted(glob.glob(os.path.join(data_dir, f"CMP-{split}-*.csv")))
     logger.info(f"Loading {len(files)} {split} lot files...")
@@ -137,25 +138,25 @@ def load_all_runs(split: str = "training") -> pd.DataFrame:
 
 
 # ============================================================
-# Step 2: Removal Rate Matching
+# Step 2: Match Removal Rate
 # ============================================================
 
 def merge_with_rr(runs_df: pd.DataFrame, split: str = "training") -> pd.DataFrame:
     """
-    Join run-aggregated data with AVG_REMOVAL_RATE.
-    Removes outliers (RR > 500).
+    Join AVG_REMOVAL_RATE onto the aggregated run data.
+    Drop outliers (RR > 500).
     """
     rr_path = os.path.join(CMP1_DIR, f"CMP-{split}-removalrate.csv")
     rr_df = pd.read_csv(rr_path)
 
-    # outlier removal
+    # Drop outliers
     n_before = len(rr_df)
     rr_df = rr_df[rr_df["AVG_REMOVAL_RATE"] <= RR_OUTLIER_THRESHOLD].copy()
-    logger.info(f"RR outlier removal: {n_before} -> {len(rr_df)}")
+    logger.info(f"RR outliers dropped: {n_before} -> {len(rr_df)}")
 
-    # join on WAFER_ID + STAGE
+    # Join on WAFER_ID + STAGE
     merged = runs_df.merge(rr_df, on=["WAFER_ID", "STAGE"], how="inner")
-    logger.info(f"After RR join: {len(merged)} runs (before: {len(runs_df)})")
+    logger.info(f"After RR match: {len(merged)} runs (before: {len(runs_df)})")
     return merged
 
 
@@ -173,11 +174,11 @@ def build_mdp_tuples(
     """
     Sort by time and generate (s, a, r, s', done) tuples + drift features.
 
-    Unified reward: r = -alpha*(e/sigma_spec)^2 - lambda*||Delta_a||_1, clip[-10,0]
+    Unified reward: r = -α(e/σ_spec)² - λ||Δa||₁, clip[-10,0]
 
     Args:
         target_rr_dict: per-STAGE target RR {"A": 97.6, "B": 80.0}
-        spec_margin_dict: per-STAGE spec margin (sigma_spec). If None, uses per-stage RR std.
+        spec_margin_dict: per-STAGE spec margin (σ_spec). If None, uses per-stage RR std.
         cross_lot: if True, ignore lot boundaries and concatenate all lots
                    within (STAGE, CHAMBER) into one long sequence.
     """
@@ -194,12 +195,13 @@ def build_mdp_tuples(
     next_drift_features = []
     lot_file_ids      = []  # lot file index per transition (for chronological split)
 
-    # group key selection: ignore lot boundaries if cross_lot
+    # Group-key choice: cross_lot ignores lot boundaries
     group_keys = ["STAGE", "CHAMBER"] if cross_lot else ["file_id", "STAGE", "CHAMBER"]
     groups = runs_df.groupby(group_keys)
     n_seq = 0
 
     for group_key, group in groups:
+        # cross_lot=True -> group_key=(stage, chamber); else (file_id, stage, chamber)
         if cross_lot:
             stage, chamber = group_key
             sort_cols = ["file_id", "first_timestamp"]
@@ -219,7 +221,7 @@ def build_mdp_tuples(
             row_t   = group.iloc[i]
             row_tp1 = group.iloc[i + 1]
 
-            # file_id: use run's own file_id in cross_lot mode
+            # file_id: when cross_lot, use this run's own file_id
             cur_file_id = int(row_t["file_id"]) if cross_lot else int(file_id)
 
             # --- State: wear(6) + process(6) + prev_RR(1) = 13D ---
@@ -236,11 +238,14 @@ def build_mdp_tuples(
             # --- Action: pressure of run t+1 ---
             a_t = np.array([row_tp1.get(c, 0.0) for c in pressure_mean_cols], dtype=np.float32)
 
-            # --- Reward: unified r = -alpha*(e/sigma)^2 - lambda*||Delta_a||_1 ---
+            # --- Reward: unified r = -α(e/σ)² - λ||Δa||₁ ---
             from src.rl.reward import compute_reward as _compute_reward
             actual_rr = float(row_tp1["AVG_REMOVAL_RATE"])
             spec_margin = spec_margin_dict.get(stage, 30.0) if spec_margin_dict else 30.0
+            # Previous action for action cost (None for first transition)
             if i > 0:
+                prev_row = group.iloc[i]  # row_t's action = row_t+1's pressure (already a_t)
+                # a_{t-1} = pressure of run t (which is row_t's pressure)
                 a_prev = np.array([row_t.get(c, 0.0) for c in pressure_mean_cols], dtype=np.float32)
             else:
                 a_prev = None
@@ -273,9 +278,9 @@ def build_mdp_tuples(
 
         n_seq += 1
 
-    logger.info(f"{n_seq} sequences -> {len(observations)} MDP tuples")
+    logger.info(f"Built {len(observations)} MDP tuples from {n_seq} sequences")
 
-    # stage_labels: 0 = Stage A, 1 = Stage B
+    # stage_labels: 0 = Stage A, 1 = Stage B — must match exact loop order above
     stage_labels = []
     for group_key, group in runs_df.groupby(group_keys):
         if cross_lot:
@@ -312,7 +317,7 @@ def build_mdp_tuples(
 
 
 # ============================================================
-# Full Pipeline
+# Full pipeline
 # ============================================================
 
 def preprocess_cmp1_r2r(
@@ -344,7 +349,7 @@ def preprocess_cmp1_r2r(
         logger.info(
             f"Stage {stage}: target_RR={target_rr_dict[stage]:.2f}, "
             f"mean={grp['AVG_REMOVAL_RATE'].mean():.2f}, "
-            f"std(=sigma_spec)={spec_margin_dict[stage]:.2f}, "
+            f"std(=σ_spec)={spec_margin_dict[stage]:.2f}, "
             f"n={len(grp)}"
         )
 
@@ -369,7 +374,7 @@ def preprocess_cmp1_r2r(
 
 
 # ============================================================
-# Script entry point
+# Smoke test
 # ============================================================
 
 if __name__ == "__main__":

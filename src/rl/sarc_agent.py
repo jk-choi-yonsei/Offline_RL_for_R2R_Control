@@ -98,7 +98,7 @@ class SARCAgent:
       2. SARCActor: drift-conditioned policy (CQL-trained)
       3. SARCCritic: drift-conditioned Q (with CQL regularization)
 
-    use_drift=False: ablation variant — actor conditions only on state, no drift context.
+    use_drift=False: operates on state only, without the DriftEncoder (ablation).
     """
 
     def __init__(
@@ -338,40 +338,6 @@ class SARCAgent:
             action = self.actor(s, context)
 
         return action.cpu().numpy().squeeze(0)
-
-    def fit_context_distribution(self, drift_np: np.ndarray):
-        """
-        Fit Gaussian to training context distribution for Mahalanobis gate.
-        Stores context_mu and context_sigma_inv. Call after encoder training.
-        """
-        if not self.use_drift:
-            return
-        self.drift_encoder.eval()
-        chunks = []
-        with torch.no_grad():
-            for i in range(0, len(drift_np), 1024):
-                d = torch.FloatTensor(drift_np[i:i + 1024]).to(self.device)
-                chunks.append(self.drift_encoder(d).cpu().numpy())
-        contexts = np.concatenate(chunks, axis=0)          # (N, context_dim)
-        self.context_mu = contexts.mean(axis=0)            # (context_dim,)
-        cov = np.cov(contexts.T) + 1e-6 * np.eye(contexts.shape[1])
-        self.context_sigma_inv = np.linalg.inv(cov)        # (context_dim, context_dim)
-        logger.info(
-            f"Context distribution fit: mu={self.context_mu.round(3)}, "
-            f"n={len(contexts)}"
-        )
-
-    def compute_context_distance(self, drift_np: np.ndarray) -> float:
-        """Mahalanobis distance of current drift from training context distribution."""
-        if not self.use_drift or not hasattr(self, "context_mu"):
-            return 0.0
-        self.drift_encoder.eval()
-        with torch.no_grad():
-            d = torch.FloatTensor(drift_np).unsqueeze(0).to(self.device)
-            ctx = self.drift_encoder(d).cpu().numpy().squeeze(0)
-        diff = ctx - self.context_mu
-        dist_sq = float(diff @ self.context_sigma_inv @ diff)
-        return float(np.sqrt(max(dist_sq, 0.0)))
 
     def save(self, path: str):
         """Save all SARC components."""

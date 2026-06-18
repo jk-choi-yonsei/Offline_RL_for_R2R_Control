@@ -16,7 +16,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 
 SEEDS = [123, 789, 1024, 2024, 7777]
-METHODS = ["SARC", "SARC-no-drift", "BC", "D-EWMA", "Kalman"]
+METHODS = ["SARC", "SARC-no-drift", "BC"]
 METRICS = ["mae", "action_cost"]
 
 DATASETS = {
@@ -41,10 +41,7 @@ def load(dataset):
         for m in METHODS:
             if m in methods:
                 per_method[m] = {k: methods[m].get(k) for k in METRICS}
-        extras = {}
-        if "per_stage" in d and "B" in d["per_stage"]:
-            extras["StageB"] = {m: d["per_stage"]["B"].get(m, {}) for m in METHODS}
-        rows.append({"seed": s, "methods": per_method, "extras": extras})
+        rows.append({"seed": s, "methods": per_method})
     return rows
 
 
